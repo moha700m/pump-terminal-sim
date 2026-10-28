@@ -8,3 +8,6 @@ public_state.json
 .watchdog.lock
 *.tmp
 __pycache__
+tokens.csv
+review-*.md
+*.bak_v1

@@ -6,15 +6,20 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 import websockets
 D=os.path.dirname(os.path.abspath(__file__)); ROOT=os.path.dirname(D)
 STATE=f"{D}/state.json"; RUGS=f"{D}/rugs.json"; DB=f"{D}/trades.db"; PORT=8811
-SUPPLY=1_000_000_000; FEE=0.01; LAT_PEN=0.02  # 1% pump fee each side + 2% latency/MEV haircut each side
-DEF_RULES={"maxSpendSol":5.34,"devMax":10,"bundleMax":20,"blacklist":True,"exitOnMove":True,"tp":60,"sl":25,
- "sizePct":3,"maxOpen":5,"goal":5,"minBuyers":10,"minVolSol":4,"watchSec":45,"maxHoldMin":10}
+SUPPLY=1_000_000_000  # fee/delay are rules (feePct, delayPct) — defaults 1% + 3% each side + random size-scaled slippage
+DEF_RULES={"maxSpendSol":5.34,"devMax":5,"devSellWindowMin":10,"top10Max":25,"sameAmtMax":3,"bundleMax":20,"feePct":1,"delayPct":3,"randSlip":True,"partialPct":50,"trailPct":20,"blacklist":True,"exitOnMove":True,"tp":60,"sl":25,
+ "sizePct":2,"maxOpen":5,"goal":5,"minBuyers":10,"minVolSol":4,"watchSec":45,"maxHoldMin":10}
 def load(p,d):
   try: return json.load(open(p))
   except Exception: return d
 S=load(STATE,None) or {"running":True,"start":1000.0,"cash":1000.0,"rules":DEF_RULES,"pos":{},"stats":{"wins":0,"loss":0,"skip":0,"seen":0,"trades":0,"realized":0.0},
   "sessionStart":time.time(),"goalHit":False}
 S["rules"]={**DEF_RULES,**S.get("rules",{})}
+if S.get("ver",1)<2:  # v2 migration (user-approved): new defaults for changed rules, keep balance/stats
+  S["rules"].update(devMax=5,sizePct=2); S["ver"]=2
+  S["stats"]["net"]=S["stats"]["realized"]; S["stats"]["gross"]=S["stats"]["realized"]  # pre-v2 trades: gross not tracked, approximated = net
+for k,v in {"gross":0.0,"net":0.0}.items(): S["stats"].setdefault(k,v)
+S.setdefault("peakEq",max(S["start"],S["cash"])); S.setdefault("maxDD",0.0)
 RUG=set(load(RUGS,[])); FEED=[]; SKIPS=load(f"{D}/skips.json",[]); SOLUSD=[100.0]; T={}  # live token map
 LOCK=threading.RLock(); WS=[None]; SUBQ=[]; STARTED=time.time(); MSGS=[0]
 db=sqlite3.connect(DB,check_same_thread=False)
@@ -30,35 +35,63 @@ def save():
     json.dump(S,open(STATE+".tmp","w")); os.replace(STATE+".tmp",STATE)
     json.dump(sorted(RUG),open(RUGS,"w")); json.dump(SKIPS[-200:],open(f"{D}/skips.json","w"))
 def price(t): return t["vS"]/t["vT"]  # SOL per token
-def buy_out(t,sol):  # constant-product bonding curve
-  sol_in=sol*(1-FEE); k=t["vS"]*t["vT"]; return (t["vT"]-k/(t["vS"]+sol_in))*(1-LAT_PEN)
-def sell_out(t,tok):
-  k=t["vS"]*t["vT"]; return (t["vS"]-k/(t["vT"]+tok))*(1-FEE)*(1-LAT_PEN)
+def cost(t,sol,rand):  # fee + delay/front-run penalty + optional random slippage scaled by size vs reserves
+  R=S["rules"]; c=R["feePct"]/100+R["delayPct"]/100
+  if rand and R["randSlip"]: c+=random.uniform(0,1)*min(0.05,sol/max(t["vS"],1)*2)
+  return min(c,0.5)
+def buy_out(t,sol,gross=False,rand=False):  # constant-product bonding curve
+  k=t["vS"]*t["vT"]; g=t["vT"]-k/(t["vS"]+sol)
+  return g if gross else (t["vT"]-k/(t["vS"]+sol*(1-S["rules"]["feePct"]/100)))*(1-(cost(t,sol,rand)-S["rules"]["feePct"]/100))
+def sell_out(t,tok,gross=False,rand=False):
+  k=t["vS"]*t["vT"]; g=t["vS"]-k/(t["vT"]+tok)
+  return g if gross else g*(1-cost(t,g,rand))
 def equity():
   v=S["cash"]
   for m,p in S["pos"].items():
     t=T.get(m); v+= (sell_out(t,p["tok"])*SOLUSD[0]) if t else p["usd"]
   return v
 def sub(keys,on=True): pass  # trades come from pump.fun swap-api polling (PumpPortal trade stream needs a paid key)
+import csv
+db.execute("create table if not exists tokens(ts real,mint text,sym text,dev text,decision text,reason text,age real,buyers int,vol real,curve real,devpct real,top10 real,bundle real,sameamt int)")
+def tokrec(t,decision,why):
+  row=[round(time.time(),1),t["mint"],t["sym"][:20],t["dev"],decision,why,round(time.time()-t["t0"],1),len(t["buyers"]),round(t["vol"],3),round(prog(t),1),round(devpct(t),2),round(top10(t),2),round(bpct(t),2),same_amt(t)]
+  db.execute("insert into tokens values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",row); db.commit()
+  new=not os.path.exists(f"{D}/tokens.csv")
+  with open(f"{D}/tokens.csv","a",newline="") as f:
+    w=csv.writer(f); new and w.writerow(["ts","mint","sym","dev","decision","reason","age_s","buyers","vol_sol","curve_pct","dev_pct","top10_pct","bundle_pct","same_amt_buyers"]); w.writerow(row)
 def skip(t,why):
-  t["done"]=True; S["stats"]["skip"]+=1; SKIPS.append([t["sym"][:12],why,time.time()]); ev(t,"skip",why); sub([t["mint"]],False)
+  tokrec(t,"skip",why); t["done"]=True; S["stats"]["skip"]+=1; SKIPS.append([t["sym"][:12],why,time.time()]); ev(t,"skip",why); sub([t["mint"]],False)
 def enter(t):
   R=S["rules"]; usd=S["cash"]*R["sizePct"]/100; sol=usd/SOLUSD[0]
   deployed=sum(p["sol"] for p in S["pos"].values())
   if deployed+sol>R["maxSpendSol"]: return skip(t,"cap: max spend reached")
-  tok=buy_out(t,sol); S["cash"]-=usd
-  S["pos"][t["mint"]]={"sym":t["sym"][:12],"sol":sol,"usd":usd,"tok":tok,"entry":sol/tok,"ts":time.time(),"peak":0,"dev":t["dev"],"bundle":list(t["bundle"])}
+  tok=buy_out(t,sol,rand=True); gtok=buy_out(t,sol,gross=True); S["cash"]-=usd
+  S["pos"][t["mint"]]={"sym":t["sym"][:12],"sol":sol,"usd":usd,"cost":usd,"tok":tok,"gtok":gtok,"entry":sol/tok,"ts":time.time(),"t0":t["t0"],"peak":0,"dev":t["dev"],"bundle":list(t["bundle"]),"half":False,"realNet":0.0,"realGross":0.0}
   S["stats"]["trades"]+=1; t["done"]=True
+  tokrec(t,"buy","passed all rules")
   why=f"buyers {len(t['buyers'])} · vol {t['vol']:.1f} SOL · curve {prog(t):.0f}% · dev {devpct(t):.0f}% · bundle {bpct(t):.0f}%"
   db.execute("insert into trades values(?,?,?,?,?,?,?,?,?)",(time.time(),t["mint"],t["sym"],"buy",sol,usd,price(t),0,why)); db.commit()
   ev(t,"buy",why,-usd); save(); log("BUY",t["sym"],round(usd,2),why)
+def sell_part(m,frac,why):
+  p=S["pos"][m]; t=T.get(m); tok=p["tok"]*frac; gtok=p.get("gtok",p["tok"])*frac; c=p["usd"]*frac
+  usd=sell_out(t,tok,rand=True)*SOLUSD[0] if t else 0.0; gusd=sell_out(t,gtok,gross=True)*SOLUSD[0] if t else 0.0
+  p["tok"]-=tok; p["gtok"]=p.get("gtok",p["tok"]+tok)-gtok; p["usd"]-=c
+  pnl=usd-c; gp=gusd-c; p["realNet"]=p.get("realNet",0)+pnl; p["realGross"]=p.get("realGross",0)+gp
+  S["cash"]+=usd; S["stats"]["realized"]+=pnl; S["stats"]["net"]+=pnl; S["stats"]["gross"]+=gp
+  db.execute("insert into trades values(?,?,?,?,?,?,?,?,?)",(time.time(),m,p["sym"],"sell" if frac>=1 else "sell_part",0,usd,price(t) if t else 0,pnl,f"{why} | gross {gp:+.2f}")); db.commit()
+  return pnl
 def exitp(m,why):
-  p=S["pos"].pop(m); t=T.get(m)
-  usd=sell_out(t,p["tok"])*SOLUSD[0] if t else 0.0
-  pnl=usd-p["usd"]; S["cash"]+=usd; S["stats"]["realized"]+=pnl; S["stats"]["wins" if pnl>0 else "loss"]+=1
-  db.execute("insert into trades values(?,?,?,?,?,?,?,?,?)",(time.time(),m,p["sym"],"sell",0,usd,price(t) if t else 0,pnl,why)); db.commit()
-  ev(t or {"mint":m,"sym":p["sym"]},"win" if pnl>0 else "loss",why,pnl); log("SELL",p["sym"],round(pnl,2),why)
+  sell_part(m,1.0,why); p=S["pos"].pop(m); t=T.get(m); pnl=p["realNet"]
+  S["stats"]["wins" if pnl>0 else "loss"]+=1
+  ev(t or {"mint":m,"sym":p["sym"]},"win" if pnl>0 else "loss",f"{why} · net {pnl:+.2f} / gross {p['realGross']:+.2f}",pnl); log("SELL",p["sym"],round(pnl,2),why)
   save()
+def top10(t):
+  h=sorted((v for w,v in t.get("hold",{}).items() if v>0),reverse=True)[:10]; return sum(h)/SUPPLY*100
+def same_amt(t):
+  a=sorted(t.get("earlySol",[])); best=0
+  for i,x in enumerate(a):
+    n=sum(1 for y in a if abs(y-x)<=max(0.02*x,0.001)); best=max(best,n)
+  return best
 devpct=lambda t:max(0,t["devTok"])/SUPPLY*100
 bpct=lambda t:sum(max(0,v) for v in t["bundleTok"].values())/SUPPLY*100
 prog=lambda t:max(0,min(100,(t["vS"]-30)/85*100))
@@ -77,13 +110,16 @@ def on_trade(x):
   early=x.get("_ts",0)-t.get("firstTs",x.get("_ts",0))<=1.5
   if side=="buy":
     t["buyers"].add(w)
+    t.setdefault("hold",{})[w]=t.get("hold",{}).get(w,0)+tok
     if w==t["dev"]: t["devTok"]+=tok
-    elif early: t["bundle"].add(w); t["bundleTok"][w]=t["bundleTok"].get(w,0)+tok
+    elif early: t["bundle"].add(w); t["bundleTok"][w]=t["bundleTok"].get(w,0)+tok; t.setdefault("earlySol",[]).append(x.get("solAmount",0) or 0)
   else:
+    t.setdefault("hold",{})[w]=t.get("hold",{}).get(w,0)-tok
     if w==t["dev"]:
       t["devTok"]-=tok; t["devSold"]=True
     if w in t["bundleTok"]: t["bundleTok"][w]-=tok
   p=S["pos"].get(t["mint"])
+  if p and side=="sell" and w==t["dev"] and time.time()-p.get("t0",t["t0"])<S["rules"]["devSellWindowMin"]*60: return exitp(t["mint"],"dev sold in first minutes → exit now")
   if p and S["rules"]["exitOnMove"] and side=="sell":
     if w==t["dev"]: return exitp(t["mint"],"dev sold → exit now")
     if w in p["bundle"] and tok>SUPPLY*0.005: return exitp(t["mint"],"bundle wallet dumping → exit now")
@@ -103,7 +139,9 @@ def tick():
     if R["blacklist"] and t["dev"] in RUG: skip(t,"dev wallet = known rug"); continue
     if devpct(t)>R["devMax"]: skip(t,f"dev holds {devpct(t):.0f}% > {R['devMax']}%"); continue
     if bpct(t)>R["bundleMax"]: skip(t,f"bundle {len(t['bundle'])} wallets hold {bpct(t):.0f}%"); continue
-    if t["devSold"]: skip(t,"dev already selling"); continue
+    if t["devSold"] and age<R["devSellWindowMin"]*60: skip(t,"dev sold within first minutes"); continue
+    if top10(t)>R["top10Max"]: skip(t,f"top-10 holders {top10(t):.0f}% > {R['top10Max']}%"); continue
+    if same_amt(t)>R["sameAmtMax"]: skip(t,f"bundle: {same_amt(t)} first-second buyers same SOL amount"); continue
     if age<R["watchSec"]: continue
     if len(S["pos"])>=R["maxOpen"]: skip(t,"max open positions"); continue
     if len(t["buyers"])>=R["minBuyers"] and t["vol"]>=R["minVolSol"] and 3<prog(t)<70: enter(t)
@@ -115,16 +153,20 @@ def tick():
         "bundleTok":{},"done":True,"last":time.time(),"devSold":False,"peakS":p.get("vS",30)}; sub([m])
     p["vS"],p["vT"]=t["vS"],t["vT"]
     val=sell_out(t,p["tok"])*SOLUSD[0]; ch=(val/p["usd"]-1)*100; p["peak"]=max(p["peak"],ch); p["now"]=ch
-    if ch>=R["tp"]: exitp(m,f"take-profit +{ch:.0f}%")
+    if ch>=R["tp"] and not p.get("half"):
+      p["half"]=True; pn=sell_part(m,R["partialPct"]/100,f"take-profit {R['partialPct']}% at +{ch:.0f}%")
+      ev(t,"win",f"sold {R['partialPct']}% at +{ch:.0f}% · trailing rest",pn); save()
     elif ch<=-R["sl"]: exitp(m,f"stop-loss {ch:.0f}%")
-    elif p["peak"]>=30 and ch<p["peak"]-25: exitp(m,f"trailing stop (peak +{p['peak']:.0f}%)")
+    elif p.get("half") and ch<p["peak"]-R["trailPct"]: exitp(m,f"trailing stop on rest (peak +{p['peak']:.0f}%)")
+    elif not p.get("half") and p["peak"]>=30 and ch<p["peak"]-25: exitp(m,f"trailing stop (peak +{p['peak']:.0f}%)")
     elif now-p["ts"]>R["maxHoldMin"]*60: exitp(m,f"time exit {ch:+.0f}%")
     elif not S["running"]: exitp(m,f"user stop → closed {ch:+.0f}%")
+  eq=equity(); S["peakEq"]=max(S["peakEq"],eq); S["maxDD"]=max(S["maxDD"],(S["peakEq"]-eq)/S["peakEq"]*100)
   if equity()>=S["start"]*R["goal"] and not S["goalHit"]: S["goalHit"]=True; log("GOAL HIT")
 def snap():
   st=S["stats"]; eq=equity()
   return {"paper":True,"running":S["running"],"goalHit":S["goalHit"],"start":S["start"],"cash":round(S["cash"],2),"equity":round(eq,2),"solusd":SOLUSD[0],
-   "stats":st,"rules":S["rules"],"rugs":len(RUG),"watching":sum(1 for t in T.values() if not t["done"]),"msgs":MSGS[0],"uptime":int(time.time()-STARTED),
+   "stats":st,"rules":S["rules"],"rugs":len(RUG),"maxDD":round(S["maxDD"],2),"netPnl":round(S["stats"]["net"],2),"grossPnl":round(S["stats"]["gross"],2),"unrealized":round(eq-S["cash"]-sum(p["usd"] for p in S["pos"].values()),2),"watching":sum(1 for t in T.values() if not t["done"]),"msgs":MSGS[0],"uptime":int(time.time()-STARTED),
    "pos":[{"mint":m,"n":p["sym"],"usd":round(p["usd"],2),"ch":round(p.get("now",0),1),"age":int(time.time()-p["ts"])} for m,p in S["pos"].items()],
    "feed":FEED[-40:][::-1],"skips":SKIPS[-30:][::-1],"ts":time.time(),"source":"PumpPortal new-token websocket + pump.fun swap-api trades (live)"}
 async def ws_loop():
@@ -185,6 +227,8 @@ async def main_loop():
     if n%60==1:
       try: SOLUSD[0]=float(json.load(urllib.request.urlopen("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT",timeout=8))["price"])
       except Exception: pass
+    if n%600==5 and time.time()-S.get("lastReview",0)>7*86400:
+      S["lastReview"]=time.time(); import subprocess; subprocess.Popen(["python3",f"{D}/review.py"])
     if n%10==0:
       save(); open(f"{D}/status.txt","w").write(time.strftime("%F %T"))
       with LOCK: json.dump(snap(),open(f"{D}/public_state.json","w"))
