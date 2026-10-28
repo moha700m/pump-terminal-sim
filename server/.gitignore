@@ -1,0 +1,10 @@
+state.json
+rugs.json
+skips.json
+trades.db
+*.log
+status.txt
+public_state.json
+.watchdog.lock
+*.tmp
+__pycache__
