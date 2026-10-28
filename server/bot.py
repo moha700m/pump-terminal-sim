@@ -16,7 +16,7 @@ S=load(STATE,None) or {"running":True,"start":1000.0,"cash":1000.0,"rules":DEF_R
   "sessionStart":time.time(),"goalHit":False}
 S["rules"]={**DEF_RULES,**S.get("rules",{})}
 RUG=set(load(RUGS,[])); FEED=[]; SKIPS=load(f"{D}/skips.json",[]); SOLUSD=[100.0]; T={}  # live token map
-LOCK=threading.Lock(); WS=[None]; SUBQ=[]; STARTED=time.time(); MSGS=[0]
+LOCK=threading.RLock(); WS=[None]; SUBQ=[]; STARTED=time.time(); MSGS=[0]
 db=sqlite3.connect(DB,check_same_thread=False)
 db.execute("create table if not exists trades(ts real,mint text,sym text,side text,sol real,usd real,price real,pnl real,reason text)")
 db.execute("create table if not exists events(ts real,mint text,sym text,kind text,reason text)")
@@ -51,14 +51,14 @@ def enter(t):
   S["stats"]["trades"]+=1; t["done"]=True
   why=f"buyers {len(t['buyers'])} · vol {t['vol']:.1f} SOL · curve {prog(t):.0f}% · dev {devpct(t):.0f}% · bundle {bpct(t):.0f}%"
   db.execute("insert into trades values(?,?,?,?,?,?,?,?,?)",(time.time(),t["mint"],t["sym"],"buy",sol,usd,price(t),0,why)); db.commit()
-  ev(t,"buy",why,-usd); log("BUY",t["sym"],round(usd,2),why)
+  ev(t,"buy",why,-usd); save(); log("BUY",t["sym"],round(usd,2),why)
 def exitp(m,why):
   p=S["pos"].pop(m); t=T.get(m)
   usd=sell_out(t,p["tok"])*SOLUSD[0] if t else 0.0
   pnl=usd-p["usd"]; S["cash"]+=usd; S["stats"]["realized"]+=pnl; S["stats"]["wins" if pnl>0 else "loss"]+=1
   db.execute("insert into trades values(?,?,?,?,?,?,?,?,?)",(time.time(),m,p["sym"],"sell",0,usd,price(t) if t else 0,pnl,why)); db.commit()
   ev(t or {"mint":m,"sym":p["sym"]},"win" if pnl>0 else "loss",why,pnl); log("SELL",p["sym"],round(pnl,2),why)
-  if t: sub([m],False)
+  save()
 devpct=lambda t:max(0,t["devTok"])/SUPPLY*100
 bpct=lambda t:sum(max(0,v) for v in t["bundleTok"].values())/SUPPLY*100
 prog=lambda t:max(0,min(100,(t["vS"]-30)/85*100))
